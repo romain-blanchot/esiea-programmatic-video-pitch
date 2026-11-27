@@ -1,0 +1,64 @@
+# Programmatic video render: triggered by Google Apps Script through the REST API (workflow_dispatch).
+name: render
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ID_Execution of the PRODUCTION row"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-${{ github.event.inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      WEBAPP_URL: ${{ secrets.WEBAPP_URL }}
+      WEBAPP_TOKEN: ${{ secrets.WEBAPP_TOKEN }}
+      RUN_ID: ${{ github.event.inputs.run_id }}
+      OUT_DIR: out
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install FFmpeg and fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Render and send back to the control sheet
+        id: render
+        run: python render.py "$RUN_ID"
+
+      # If the job breaks before render.py could report, tell the sheet so the row does not stay pending.
+      - name: Report setup failure to the control sheet
+        if: failure() && steps.render.outcome != 'failure'
+        run: |
+          if [ -n "$WEBAPP_URL" ] && [ -n "$WEBAPP_TOKEN" ]; then
+            python -c 'import json,os; print(json.dumps({"action":"render_done","token":os.environ["WEBAPP_TOKEN"],"run_id":os.environ["RUN_ID"],"error":"GitHub Actions setup failed, see the run logs"}))' > payload.json
+            curl -sSL -H "Content-Type: text/plain" --data @payload.json "$WEBAPP_URL" || true
+          fi
+
+      # Debug copy only when something failed (kept 3 days). Successful renders are stored in Google Drive only.
+      - name: Upload debug artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-${{ github.event.inputs.run_id }}
+          path: out/
+          retention-days: 3
+          if-no-files-found: ignore
